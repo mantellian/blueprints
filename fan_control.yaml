@@ -191,11 +191,11 @@ action:
             event_data:
               fan_state: "{{ states(!input fan_entity) }}"
               timestamp: "{{ now().isoformat() }}"
-      
-      # ========================================================================
-      # BRANCH 2: TEMPERATURE CONTROL LOGIC
-      # ========================================================================
-      default:
+    
+    # ========================================================================
+    # BRANCH 2: TEMPERATURE CONTROL LOGIC
+    # ========================================================================
+    default:
         - variables:
             temp: "{{ states(!input temp_sensor) | float }}"
             set_point: "{{ states(!input setpoint) | float }}"
