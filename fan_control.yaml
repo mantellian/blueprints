@@ -1,0 +1,308 @@
+blueprint:
+  name: Complete Fan Control with Temperature & Manual Override
+  description: >
+    Comprehensive fan automation that handles:
+    - Temperature-based on/off control
+    - Occupancy awareness (home/away)
+    - Bedtime mode integration
+    - Manual override detection
+    - Anti-cycling protection (prevents rapid on/off)
+    - Event firing for tracking
+  domain: automation
+  input:
+    fan_entity:
+      name: Fan Switch
+      description: The switch entity that controls your fan
+      selector:
+        entity:
+          domain: switch
+    
+    temp_sensor:
+      name: Temperature Sensor
+      description: Temperature sensor for this room/area
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    
+    setpoint:
+      name: Temperature Setpoint
+      description: Input number that stores the temperature setpoint
+      selector:
+        entity:
+          domain: input_number
+    
+    last_on_helper:
+      name: Last On Timestamp
+      description: Input datetime to track when fan was last turned on
+      selector:
+        entity:
+          domain: input_datetime
+    
+    last_off_helper:
+      name: Last Off Timestamp
+      description: Input datetime to track when fan was last turned off
+      selector:
+        entity:
+          domain: input_datetime
+    
+    manual_override:
+      name: Manual Override Boolean
+      description: Input boolean that flags when manual control is detected
+      selector:
+        entity:
+          domain: input_boolean
+    
+    fan_enabled:
+      name: Fan Automation Enabled
+      description: Input boolean to enable/disable this fan automation
+      selector:
+        entity:
+          domain: input_boolean
+    
+    room_name:
+      name: Room Identifier
+      description: Short name for events and identification (e.g. "living_room", "master_bed", "emily_room")
+      default: "room"
+      selector:
+        text:
+    
+    occupancy_sensor:
+      name: Occupancy Sensor
+      description: Boolean that indicates if anyone is home
+      default: input_boolean.anyone_home
+      selector:
+        entity:
+          domain: input_boolean
+    
+    bedtime_sensor:
+      name: Bedtime Active Sensor
+      description: Boolean that indicates if bedtime mode is active
+      default: input_boolean.bedtime_active
+      selector:
+        entity:
+          domain: input_boolean
+    
+    min_off_delay:
+      name: Minimum Off Delay (seconds)
+      description: Minimum time fan must be off before auto-turning on (prevents short cycling)
+      default: 300
+      selector:
+        number:
+          min: 60
+          max: 600
+          step: 30
+          unit_of_measurement: seconds
+    
+    min_on_delay:
+      name: Minimum On Delay (seconds)
+      description: Minimum time fan must be on before auto-turning off (prevents short cycling)
+      default: 900
+      selector:
+        number:
+          min: 300
+          max: 1800
+          step: 60
+          unit_of_measurement: seconds
+    
+    temp_differential:
+      name: Temperature Differential
+      description: How many degrees below setpoint before turning off (prevents rapid cycling)
+      default: 1
+      selector:
+        number:
+          min: 0.5
+          max: 3
+          step: 0.5
+          unit_of_measurement: "°F"
+    
+    manual_detection_delay:
+      name: Manual Detection Delay (seconds)
+      description: How long after automation control to consider a change "manual"
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          unit_of_measurement: seconds
+
+mode: restart
+
+trigger:
+  # ============================================================================
+  # TEMPERATURE CONTROL TRIGGERS
+  # ============================================================================
+  - platform: state
+    entity_id: !input temp_sensor
+    id: temp_control
+  
+  - platform: state
+    entity_id: !input occupancy_sensor
+    id: temp_control
+  
+  - platform: state
+    entity_id: !input bedtime_sensor
+    id: temp_control
+  
+  # ============================================================================
+  # MANUAL OVERRIDE DETECTION TRIGGER
+  # ============================================================================
+  - platform: state
+    entity_id: !input fan_entity
+    id: manual_toggle
+
+condition:
+  # Only run if fan automation is enabled
+  - condition: state
+    entity_id: !input fan_enabled
+    state: "on"
+
+action:
+  - choose:
+      # ========================================================================
+      # BRANCH 1: MANUAL TOGGLE DETECTION
+      # ========================================================================
+      - conditions:
+          - condition: trigger
+            id: manual_toggle
+        sequence:
+          - variables:
+              last_on_ts: >
+                {% set s = states(!input last_on_helper) %}
+                {{ as_timestamp(s) if s not in ['unknown', 'unavailable', None] else 0 }}
+              last_off_ts: >
+                {% set s = states(!input last_off_helper) %}
+                {{ as_timestamp(s) if s not in ['unknown', 'unavailable', None] else 0 }}
+              now_ts: "{{ as_timestamp(now()) }}"
+              manual_delay: !input manual_detection_delay
+          
+          # Only set manual override if enough time has passed since automation control
+          - condition: template
+            value_template: >
+              {{ (now_ts - last_on_ts > manual_delay) and 
+                 (now_ts - last_off_ts > manual_delay) }}
+          
+          - action: input_boolean.turn_on
+            target:
+              entity_id: !input manual_override
+          
+          - event: "{{ !input room_name }}_fan_manual_override"
+            event_data:
+              fan_state: "{{ states(!input fan_entity) }}"
+              timestamp: "{{ now().isoformat() }}"
+      
+      # ========================================================================
+      # BRANCH 2: TEMPERATURE CONTROL LOGIC
+      # ========================================================================
+      default:
+        - variables:
+            temp: "{{ states(!input temp_sensor) | float }}"
+            set_point: "{{ states(!input setpoint) | float }}"
+            temp_diff: !input temp_differential
+            last_off_ts: >
+              {% set s = states(!input last_off_helper) %}
+              {{ as_timestamp(s) if s not in ['unknown', 'unavailable', None] else 0 }}
+            last_on_ts: >
+              {% set s = states(!input last_on_helper) %}
+              {{ as_timestamp(s) if s not in ['unknown', 'unavailable', None] else 0 }}
+            anyone_home: "{{ is_state(!input occupancy_sensor, 'on') }}"
+            bedtime_active: "{{ is_state(!input bedtime_sensor, 'on') }}"
+            fan_is_on: "{{ is_state(!input fan_entity, 'on') }}"
+            room_name: !input room_name
+            min_off_delay: !input min_off_delay
+            min_on_delay: !input min_on_delay
+        
+        - choose:
+            # ================================================================
+            # CONDITION 1: TURN OFF IMMEDIATELY
+            # Nobody home OR bedtime active
+            # ================================================================
+            - conditions:
+                - condition: template
+                  value_template: "{{ (not anyone_home or bedtime_active) and fan_is_on }}"
+              sequence:
+                - action: switch.turn_off
+                  target:
+                    entity_id: !input fan_entity
+                
+                - action: input_boolean.turn_off
+                  target:
+                    entity_id: !input manual_override
+                
+                - action: input_datetime.set_datetime
+                  target:
+                    entity_id: !input last_off_helper
+                  data:
+                    datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                
+                - event: "{{ room_name }}_fan_auto_off"
+                  event_data:
+                    reason: "{{ 'bedtime_active' if bedtime_active else 'nobody_home' }}"
+                    timestamp: "{{ now().isoformat() }}"
+            
+            # ================================================================
+            # CONDITION 2: TURN ON
+            # Temp >= setpoint, someone home, NOT bedtime, anti-cycling OK
+            # ================================================================
+            - conditions:
+                - condition: template
+                  value_template: >
+                    {{ anyone_home and not bedtime_active and
+                       temp >= set_point and
+                       not fan_is_on and
+                       (as_timestamp(now()) - last_off_ts) > min_off_delay and
+                       not is_state(!input manual_override, 'on') }}
+              sequence:
+                - action: switch.turn_on
+                  target:
+                    entity_id: !input fan_entity
+                
+                - action: input_datetime.set_datetime
+                  target:
+                    entity_id: !input last_on_helper
+                  data:
+                    datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                
+                - action: input_boolean.turn_off
+                  target:
+                    entity_id: !input manual_override
+                
+                - event: "{{ room_name }}_fan_auto_on"
+                  event_data:
+                    reason: temperature_high
+                    temperature: "{{ temp }}"
+                    setpoint: "{{ set_point }}"
+                    timestamp: "{{ now().isoformat() }}"
+            
+            # ================================================================
+            # CONDITION 3: TURN OFF (Temperature Drop)
+            # Temp dropped below (setpoint - differential), anti-cycling OK
+            # ================================================================
+            - conditions:
+                - condition: template
+                  value_template: >
+                    {{ temp < (set_point - temp_diff) and
+                       fan_is_on and
+                       (as_timestamp(now()) - last_on_ts) > min_on_delay }}
+              sequence:
+                - action: switch.turn_off
+                  target:
+                    entity_id: !input fan_entity
+                
+                - action: input_datetime.set_datetime
+                  target:
+                    entity_id: !input last_off_helper
+                  data:
+                    datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                
+                - action: input_boolean.turn_off
+                  target:
+                    entity_id: !input manual_override
+                
+                - event: "{{ room_name }}_fan_auto_off"
+                  event_data:
+                    reason: temperature_low
+                    temperature: "{{ temp }}"
+                    setpoint: "{{ set_point }}"
+                    timestamp: "{{ now().isoformat() }}"
